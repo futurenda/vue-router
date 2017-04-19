@@ -572,23 +572,37 @@ function cleanPath (path) {
 
 function createRouteMap (
   routes,
+  oldPathList,
   oldPathMap,
   oldNameMap
 ) {
+  // the path list is used to control path matching priority
+  var pathList = oldPathList || [];
   var pathMap = oldPathMap || Object.create(null);
   var nameMap = oldNameMap || Object.create(null);
 
   routes.forEach(function (route) {
-    addRouteRecord(pathMap, nameMap, route);
+    addRouteRecord(pathList, pathMap, nameMap, route);
   });
 
+  // ensure wildcard routes are always at the end
+  for (var i = 0, l = pathList.length; i < l; i++) {
+    if (pathList[i] === '*') {
+      pathList.push(pathList.splice(i, 1)[0]);
+      l--;
+      i--;
+    }
+  }
+
   return {
+    pathList: pathList,
     pathMap: pathMap,
     nameMap: nameMap
   }
 }
 
 function addRouteRecord (
+  pathList,
   pathMap,
   nameMap,
   route,
@@ -643,7 +657,7 @@ function addRouteRecord (
       var childMatchAs = matchAs
         ? cleanPath((matchAs + "/" + (child.path)))
         : undefined;
-      addRouteRecord(pathMap, nameMap, child, record, childMatchAs);
+      addRouteRecord(pathList, pathMap, nameMap, child, record, childMatchAs);
     });
   }
 
@@ -654,18 +668,19 @@ function addRouteRecord (
           path: alias,
           children: route.children
         };
-        addRouteRecord(pathMap, nameMap, aliasRoute, parent, record.path);
+        addRouteRecord(pathList, pathMap, nameMap, aliasRoute, parent, record.path);
       });
     } else {
       var aliasRoute = {
         path: route.alias,
         children: route.children
       };
-      addRouteRecord(pathMap, nameMap, aliasRoute, parent, record.path);
+      addRouteRecord(pathList, pathMap, nameMap, aliasRoute, parent, record.path);
     }
   }
 
   if (!pathMap[record.path]) {
+    pathList.push(record.path);
     pathMap[record.path] = record;
   }
 
@@ -1237,11 +1252,12 @@ function createMatcher (
   router
 ) {
   var ref = createRouteMap(routes);
+  var pathList = ref.pathList;
   var pathMap = ref.pathMap;
   var nameMap = ref.nameMap;
 
   function addRoutes (routes) {
-    createRouteMap(routes, pathMap, nameMap);
+    createRouteMap(routes, pathList, pathMap, nameMap);
   }
 
   function match (
@@ -1279,7 +1295,8 @@ function createMatcher (
       }
     } else if (location.path) {
       location.params = {};
-      for (var path in pathMap) {
+      for (var i = 0; i < pathList.length; i++) {
+        var path = pathList[i];
         if (matchRoute(path, location.params, location.path)) {
           return _createRoute(pathMap[path], location, redirectedFrom)
         }
@@ -1880,70 +1897,65 @@ function poll (
 }
 
 function resolveAsyncComponents (matched) {
-  var _next;
-  var pending = 0;
-  var error = null;
+  return function (to, from, next) {
+    var hasAsync = false;
+    var pending = 0;
+    var error = null;
 
-  flatMapComponents(matched, function (def, _, match, key) {
-    // if it's a function and doesn't have cid attached,
-    // assume it's an async component resolve function.
-    // we are not using Vue's default async resolving mechanism because
-    // we want to halt the navigation until the incoming component has been
-    // resolved.
-    if (typeof def === 'function' && def.cid === undefined) {
-      pending++;
+    flatMapComponents(matched, function (def, _, match, key) {
+      // if it's a function and doesn't have cid attached,
+      // assume it's an async component resolve function.
+      // we are not using Vue's default async resolving mechanism because
+      // we want to halt the navigation until the incoming component has been
+      // resolved.
+      if (typeof def === 'function' && def.cid === undefined) {
+        hasAsync = true;
+        pending++;
 
-      var resolve = once(function (resolvedDef) {
-        // save resolved on async factory in case it's used elsewhere
-        def.resolved = typeof resolvedDef === 'function'
-          ? resolvedDef
-          : _Vue.extend(resolvedDef);
-        match.components[key] = resolvedDef;
-        pending--;
-        if (pending <= 0 && _next) {
-          _next();
+        var resolve = once(function (resolvedDef) {
+          // save resolved on async factory in case it's used elsewhere
+          def.resolved = typeof resolvedDef === 'function'
+            ? resolvedDef
+            : _Vue.extend(resolvedDef);
+          match.components[key] = resolvedDef;
+          pending--;
+          if (pending <= 0) {
+            next();
+          }
+        });
+
+        var reject = once(function (reason) {
+          var msg = "Failed to resolve async component " + key + ": " + reason;
+          "development" !== 'production' && warn(false, msg);
+          if (!error) {
+            error = reason instanceof Error
+              ? reason
+              : new Error(msg);
+            next(error);
+          }
+        });
+
+        var res;
+        try {
+          res = def(resolve, reject);
+        } catch (e) {
+          reject(e);
         }
-      });
-
-      var reject = once(function (reason) {
-        var msg = "Failed to resolve async component " + key + ": " + reason;
-        "development" !== 'production' && warn(false, msg);
-        if (!error) {
-          error = reason instanceof Error
-            ? reason
-            : new Error(msg);
-          if (_next) { _next(error); }
-        }
-      });
-
-      var res;
-      try {
-        res = def(resolve, reject);
-      } catch (e) {
-        reject(e);
-      }
-      if (res) {
-        if (typeof res.then === 'function') {
-          res.then(resolve, reject);
-        } else {
-          // new syntax in Vue 2.3
-          var comp = res.component;
-          if (comp && typeof comp.then === 'function') {
-            comp.then(resolve, reject);
+        if (res) {
+          if (typeof res.then === 'function') {
+            res.then(resolve, reject);
+          } else {
+            // new syntax in Vue 2.3
+            var comp = res.component;
+            if (comp && typeof comp.then === 'function') {
+              comp.then(resolve, reject);
+            }
           }
         }
       }
-    }
-  });
+    });
 
-  return function (to, from, next) {
-    if (error) {
-      next(error);
-    } else if (pending <= 0) {
-      next();
-    } else {
-      _next = next;
-    }
+    if (!hasAsync) { next(); }
   }
 }
 
@@ -2049,6 +2061,16 @@ var HTML5History = (function (History$$1) {
 
 function getLocation (base) {
   var path = window.location.pathname;
+
+  // Special handling for cases where base contains hash ('#')
+  if (base && base.indexOf('#') > -1) {
+    path = window.location.href.replace(window.location.origin, '');
+    if (path.indexOf(base) === 0) {
+      // Leave the rest of the url as-is
+      return (path.slice(base.length) || '/')
+    }
+  }
+
   if (base && path.indexOf(base) === 0) {
     path = path.slice(base.length);
   }
